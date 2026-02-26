@@ -15,8 +15,10 @@ app.post("/scan", async (req, res) => {
     return res.status(400).json({ error: "URL is required" });
   }
 
-  const browser = await chromium.launch();
-  const page = await browser.newPage();
+const browser = await chromium.launch({
+  executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined,
+  args: ["--no-sandbox", "--disable-setuid-sandbox"],
+});  const page = await browser.newPage();
 
   try {
     await page.goto(url, { waitUntil: "networkidle" });
