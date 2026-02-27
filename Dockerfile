@@ -1,13 +1,9 @@
-FROM ubuntu:22.04
+FROM node:18-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install Node.js and system dependencies for Chromium
 RUN apt-get update && apt-get install -y \
-    curl \
-    nodejs \
-    npm \
-    chromium-browser \
+    chromium \
     libglib2.0-0 \
     libnss3 \
     libnspr4 \
@@ -32,12 +28,11 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+
 COPY package*.json ./
 RUN npm install
-
-# Tell Playwright to use system Chromium
-ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
 COPY . .
 
