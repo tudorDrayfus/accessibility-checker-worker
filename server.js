@@ -3,6 +3,7 @@ const { chromium } = require("playwright");
 const fs = require("fs");
 const path = require("path");
 const cors = require("cors");
+const { getCompliance, close: ibmClose } = require("accessibility-checker");
 
 const app = express();
 app.use(cors());
@@ -15,7 +16,7 @@ app.get("/", function(req, res) {
 app.get("/test", async function(req, res) {
   try {
     const browser = await chromium.launch({
-      args: ["--no-sandbox", "--disable-setuid-sandbox"]
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu", "--disable-gpu-sandbox"]
     });
     await browser.close();
     res.json({ status: "chromium ok" });
@@ -348,92 +349,114 @@ async function dismissCookieBanners(page) {
   if (hit) { await page.waitForTimeout(1200); }
 }
 
+// Creates a new page and applies all standard configuration (viewport, CMP blocking, init script).
+async function configureNewPage(browser) {
+  var page = await browser.newPage();
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  // Block known CMP script domains before the page loads
+  await page.route("**/*", function(route) {
+    var reqUrl = route.request().url();
+    for (var i = 0; i < CMP_BLOCK_PATTERNS.length; i++) {
+      if (reqUrl.includes(CMP_BLOCK_PATTERNS[i])) {
+        route.abort();
+        return;
+      }
+    }
+    route.continue();
+  });
+
+  // Inject a MutationObserver before any page JS runs.
+  // It watches the DOM and nukes cookie banner elements the instant they appear —
+  // before the browser paints them — regardless of which CMP is used.
+  await page.addInitScript(function() {
+    var NUKE_IDS = [
+      "CybotCookiebotDialog", "CybotCookiebotDialogBodyUnderlay",
+      "onetrust-consent-sdk", "onetrust-banner-sdk",
+      "didomi-host", "didomi-popup",
+      "iubenda-cs-banner",
+      "cookiebanner", "cookie-banner", "cookie-consent", "cookie-notice",
+      "cookie-law-info-bar", "CookieConsent", "cookieConsent",
+      "gdpr-banner", "gdpr-consent", "consent-banner",
+      "cmpbox", "BorlabsCookie", "cky-consent",
+    ];
+    var NUKE_PATTERN = /^(cookie[-_]?(banner|consent|notice|bar|law|popup|overlay)|gdpr[-_]?(banner|bar|popup)|consent[-_]?(banner|bar|popup|notice)|cookiebanner|cookieconsent|cookienotice|cmpbox|cookielaw|cybot|borlabs|termly)/i;
+
+    function shouldNuke(el) {
+      if (!el || el.nodeType !== 1) return false;
+      var id = (el.id || "").toLowerCase();
+      var cls = (typeof el.className === "string" ? el.className : "").toLowerCase();
+      for (var i = 0; i < NUKE_IDS.length; i++) {
+        if (id === NUKE_IDS[i].toLowerCase()) return true;
+      }
+      return NUKE_PATTERN.test(id) || NUKE_PATTERN.test(cls);
+    }
+
+    function nukeEl(el) {
+      if (shouldNuke(el)) {
+        el.style.setProperty("display", "none", "important");
+        el.style.setProperty("visibility", "hidden", "important");
+        el.style.setProperty("opacity", "0", "important");
+      }
+      // Walk children too (e.g. wrapper divs that hold the banner)
+      if (el.children) {
+        for (var i = 0; i < el.children.length; i++) nukeEl(el.children[i]);
+      }
+    }
+
+    var mo = new MutationObserver(function(mutations) {
+      for (var m = 0; m < mutations.length; m++) {
+        var added = mutations[m].addedNodes;
+        for (var n = 0; n < added.length; n++) {
+          if (added[n].nodeType === 1) nukeEl(added[n]);
+        }
+        // Also check attribute changes — some CMPs toggle a class on <body> to show the banner
+        if (mutations[m].type === "attributes" && mutations[m].target.nodeType === 1) {
+          nukeEl(mutations[m].target);
+        }
+      }
+    });
+    mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["id", "class"] });
+
+    // Also scan whatever is already in the DOM at injection time (server-rendered banners)
+    document.addEventListener("DOMContentLoaded", function() {
+      var all = document.querySelectorAll("*");
+      for (var i = 0; i < all.length; i++) nukeEl(all[i]);
+      // Remove body/html scroll-lock that CMPs inject
+      document.documentElement.style.setProperty("overflow", "auto", "important");
+      document.body && document.body.style.setProperty("overflow", "auto", "important");
+    });
+  });
+
+  return page;
+}
+
 // Scans a single URL with an already-open browser. Returns the page result object.
 async function scanPage(browser, url) {
   var axePath = path.join(__dirname, "node_modules/axe-core/axe.min.js");
   var axeScript = fs.readFileSync(axePath, "utf8");
 
-  var page = await browser.newPage();
+  var page = await configureNewPage(browser);
   try {
-    await page.setViewportSize({ width: 1440, height: 900 });
-
-    // Block known CMP script domains before the page loads
-    await page.route("**/*", function(route) {
-      var reqUrl = route.request().url();
-      for (var i = 0; i < CMP_BLOCK_PATTERNS.length; i++) {
-        if (reqUrl.includes(CMP_BLOCK_PATTERNS[i])) {
-          route.abort();
-          return;
-        }
-      }
-      route.continue();
-    });
-
-    // Inject a MutationObserver before any page JS runs.
-    // It watches the DOM and nukes cookie banner elements the instant they appear —
-    // before the browser paints them — regardless of which CMP is used.
-    await page.addInitScript(function() {
-      var NUKE_IDS = [
-        "CybotCookiebotDialog", "CybotCookiebotDialogBodyUnderlay",
-        "onetrust-consent-sdk", "onetrust-banner-sdk",
-        "didomi-host", "didomi-popup",
-        "iubenda-cs-banner",
-        "cookiebanner", "cookie-banner", "cookie-consent", "cookie-notice",
-        "cookie-law-info-bar", "CookieConsent", "cookieConsent",
-        "gdpr-banner", "gdpr-consent", "consent-banner",
-        "cmpbox", "BorlabsCookie", "cky-consent",
-      ];
-      var NUKE_PATTERN = /^(cookie[-_]?(banner|consent|notice|bar|law|popup|overlay)|gdpr[-_]?(banner|bar|popup)|consent[-_]?(banner|bar|popup|notice)|cookiebanner|cookieconsent|cookienotice|cmpbox|cookielaw|cybot|borlabs|termly)/i;
-
-      function shouldNuke(el) {
-        if (!el || el.nodeType !== 1) return false;
-        var id = (el.id || "").toLowerCase();
-        var cls = (typeof el.className === "string" ? el.className : "").toLowerCase();
-        for (var i = 0; i < NUKE_IDS.length; i++) {
-          if (id === NUKE_IDS[i].toLowerCase()) return true;
-        }
-        return NUKE_PATTERN.test(id) || NUKE_PATTERN.test(cls);
-      }
-
-      function nukeEl(el) {
-        if (shouldNuke(el)) {
-          el.style.setProperty("display", "none", "important");
-          el.style.setProperty("visibility", "hidden", "important");
-          el.style.setProperty("opacity", "0", "important");
-        }
-        // Walk children too (e.g. wrapper divs that hold the banner)
-        if (el.children) {
-          for (var i = 0; i < el.children.length; i++) nukeEl(el.children[i]);
-        }
-      }
-
-      var mo = new MutationObserver(function(mutations) {
-        for (var m = 0; m < mutations.length; m++) {
-          var added = mutations[m].addedNodes;
-          for (var n = 0; n < added.length; n++) {
-            if (added[n].nodeType === 1) nukeEl(added[n]);
-          }
-          // Also check attribute changes — some CMPs toggle a class on <body> to show the banner
-          if (mutations[m].type === "attributes" && mutations[m].target.nodeType === 1) {
-            nukeEl(mutations[m].target);
-          }
-        }
-      });
-      mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["id", "class"] });
-
-      // Also scan whatever is already in the DOM at injection time (server-rendered banners)
-      document.addEventListener("DOMContentLoaded", function() {
-        var all = document.querySelectorAll("*");
-        for (var i = 0; i < all.length; i++) nukeEl(all[i]);
-        // Remove body/html scroll-lock that CMPs inject
-        document.documentElement.style.setProperty("overflow", "auto", "important");
-        document.body && document.body.style.setProperty("overflow", "auto", "important");
-      });
-    });
-
     // domcontentloaded is much faster than "load" on heavy commercial sites —
     // it doesn't wait for ads, analytics, fonts, and third-party trackers to finish.
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+    // Some sites crash the renderer on first load (heavy JS, WebGL, etc.).
+    // Retry once with a fresh fully-configured page before giving up.
+    var gotoError = null;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      try {
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+        gotoError = null;
+        break;
+      } catch (err) {
+        gotoError = err;
+        // Only retry on page crash — other errors (404, timeout, DNS) are terminal
+        if (!String(err).includes("Page crashed") || attempt > 0) break;
+        try { await page.close(); } catch (e) {}
+        page = await configureNewPage(browser);
+      }
+    }
+    if (gotoError) throw gotoError;
     // Give JS-driven CMPs and lazy content a moment to initialise
     await page.waitForTimeout(1500);
 
@@ -445,7 +468,7 @@ async function scanPage(browser, url) {
       await new Promise(function(resolve) {
         var totalHeight = 0;
         var distance = 400;
-        var maxScroll = 30000;
+        var maxScroll = 8000;
         var timer = setInterval(function() {
           window.scrollBy(0, distance);
           totalHeight += distance;
@@ -470,19 +493,55 @@ async function scanPage(browser, url) {
     await forceHideCookieBanners(page);
     await page.waitForTimeout(300);
 
-    // Screenshot
-    var screenshotBuffer = await page.screenshot({ fullPage: true, type: "jpeg", quality: 85 });
-    var screenshotBase64 = screenshotBuffer.toString("base64");
-
-    var pageHeight = await page.evaluate(function() {
-      return document.documentElement.scrollHeight;
-    });
+    // Screenshot — try full-page first, fall back to viewport if the renderer crashes
+    var screenshotBase64;
+    var pageHeight;
+    try {
+      pageHeight = await page.evaluate(function() {
+        return Math.min(document.documentElement.scrollHeight, 8000);
+      });
+      var screenshotBuffer = await page.screenshot({ fullPage: true, type: "jpeg", quality: 70 });
+      screenshotBase64 = screenshotBuffer.toString("base64");
+    } catch (screenshotErr) {
+      // Renderer crashed on full-page (e.g. very tall page + SwiftShader OOM).
+      // Fall back to a viewport-only screenshot so the scan can still complete.
+      pageHeight = 900;
+      var fallbackBuffer = await page.screenshot({ fullPage: false, type: "jpeg", quality: 70 });
+      screenshotBase64 = fallbackBuffer.toString("base64");
+    }
 
     // Axe
     await page.evaluate(axeScript);
     var results = await page.evaluate(async function() {
       return await window.axe.run();
     });
+
+    // IBM Equal Access — runs in the same Playwright session, no extra browser cost.
+    // INJECT mode (see .achecker.yml) fetches ace.js server-side once and caches it,
+    // then injects the script content directly — avoids target-page CSP blocks.
+    var ibmViolations = [];
+    try {
+      var ibmTimeout = new Promise(function(_, reject) {
+        setTimeout(function() { reject(new Error("IBM checker timed out")); }, 20000);
+      });
+      var ibmReport = await Promise.race([getCompliance(page, url), ibmTimeout]);
+      if (ibmReport && ibmReport.report && ibmReport.report.results) {
+        // Aggregate by ruleId — count affected elements per rule
+        var ibmMap = {};
+        for (var r of ibmReport.report.results) {
+          if (r.level !== "violation" && r.level !== "potentialviolation") continue;
+          if (!ibmMap[r.ruleId]) ibmMap[r.ruleId] = 0;
+          ibmMap[r.ruleId]++;
+        }
+        ibmViolations = Object.entries(ibmMap).map(function([ruleId, count]) {
+          return { ruleId: ruleId, nodes: count, impact: "serious" };
+        });
+      }
+    } catch (ibmErr) {
+      console.error("[IBM] error:", ibmErr.message);
+    }
+    // Free IBM engine memory after each scan
+    try { await ibmClose(); } catch (e) {}
 
     await page.evaluate(function() { window.scrollTo(0, 0); });
 
@@ -523,6 +582,7 @@ async function scanPage(browser, url) {
     return {
       url: url,
       violations: violationsWithBoxes,
+      ibmViolations: ibmViolations,
       screenshot: screenshotBase64,
       pageWidth: 1440,
       pageHeight: pageHeight
@@ -545,7 +605,17 @@ app.post("/scan", async function(req, res) {
 
   var browser = null;
   try {
-    browser = await chromium.launch({ args: ["--no-sandbox", "--disable-setuid-sandbox"] });
+    browser = await chromium.launch({ args: [
+      "--no-sandbox", "--disable-setuid-sandbox",
+      "--disable-gpu", "--disable-gpu-sandbox", "--disable-software-rasterizer",
+      "--disable-dev-shm-usage",
+      "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
+      "--disable-webgl", "--disable-3d-apis",
+      "--no-zygote",
+      "--js-flags=--max-old-space-size=400",
+      "--disable-extensions", "--disable-background-networking", "--disable-sync",
+      "--metrics-recording-only", "--mute-audio", "--no-default-browser-check",
+    ] });
 
     // Scan all pages in parallel — same browser, separate page contexts
     var pages = await Promise.all(urls.map(function(url) { return scanPage(browser, url); }));
@@ -556,6 +626,7 @@ app.post("/scan", async function(req, res) {
     if (pages.length === 1) {
       res.json({
         violations: pages[0].violations,
+        ibmViolations: pages[0].ibmViolations || [],
         total: pages[0].violations.length,
         screenshot: pages[0].screenshot,
         pageWidth: pages[0].pageWidth,

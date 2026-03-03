@@ -8,6 +8,7 @@
     "postinstall": "npx playwright install chromium"
   },
   "dependencies": {
+    "accessibility-checker": "^4.0.12",
     "axe-core": "^4.10.3",
     "cors": "^2.8.5",
     "express": "^4.21.2",

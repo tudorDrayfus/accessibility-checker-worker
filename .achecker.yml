@@ -1,0 +1,5 @@
+# IBM Equal Access Checker configuration
+# INJECT mode: server fetches ace.js from jsDelivr once and caches it in memory.
+# The cached script content is injected directly into each page — avoids CSP
+# issues and eliminates the per-scan CDN roundtrip.
+engineMode: INJECT
